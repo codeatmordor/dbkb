@@ -1,24 +1,26 @@
 package ast
 
 import (
-	"inmempg/token" // Assuming inmempg is the module name
+	"bytes"
+	"fmt"
+	"strings"
+
+	"inmempg/token"
 )
 
 // Node is the base interface for all AST nodes.
 type Node interface {
-	TokenLiteral() string // Returns the literal value of the token this node is associated with
-	String() string       // For debugging and testing
+	TokenLiteral() string
+	String() string
 }
 
-// Statement represents a SQL statement (e.g., CREATE TABLE, INSERT, SELECT).
-// All statement nodes implement this interface.
+// Statement represents a SQL statement.
 type Statement interface {
 	Node
 	statementNode() // Marker method
 }
 
-// Expression represents a value or computation (e.g., a literal, an identifier, an arithmetic operation).
-// All expression nodes implement this interface.
+// Expression represents a value or computation.
 type Expression interface {
 	Node
 	expressionNode() // Marker method
@@ -26,9 +28,8 @@ type Expression interface {
 
 // === Basic Concrete Node Types ===
 
-// Identifier represents an identifier (e.g., table name, column name).
 type Identifier struct {
-	Token token.Token // The token.IDENT token
+	Token token.Token // token.IDENT
 	Value string
 }
 
@@ -36,34 +37,73 @@ func (i *Identifier) expressionNode()      {}
 func (i *Identifier) TokenLiteral() string { return i.Token.Literal }
 func (i *Identifier) String() string       { return i.Value }
 
-// LiteralValue represents a literal value like a string or a number.
-// This is a basic form; in a more complex parser, you'd have distinct
-// StringLiteral, IntegerLiteral, etc., implementing Expression.
 type LiteralValue struct {
-	Token token.Token // The token (e.g., token.STRING, token.INT)
-	Value string      // The actual value
+	Token token.Token // e.g., token.STRING, token.INT
+	Value string
 }
 
 func (lv *LiteralValue) expressionNode()      {}
 func (lv *LiteralValue) TokenLiteral() string { return lv.Token.Literal }
-func (lv *LiteralValue) String() string       { return lv.Token.Literal } // Or lv.Value, depending on desired string output
+func (lv *LiteralValue) String() string {
+	if lv.Token.Type == token.STRING {
+		return "'" + lv.Value + "'"
+	}
+	return lv.Value
+}
+
+// BooleanLiteral represents a TRUE or FALSE literal.
+type BooleanLiteral struct {
+	Token token.Token // The TRUE or FALSE token
+	Value bool
+}
+
+func (bl *BooleanLiteral) expressionNode()      {}
+func (bl *BooleanLiteral) TokenLiteral() string { return bl.Token.Literal }
+func (bl *BooleanLiteral) String() string       { return bl.Token.Literal }
+
+
+type InfixExpression struct {
+	Token    token.Token // The operator token, e.g., +
+	Left     Expression
+	Operator string
+	Right    Expression
+}
+
+func (ie *InfixExpression) expressionNode()      {}
+func (ie *InfixExpression) TokenLiteral() string { return ie.Token.Literal }
+func (ie *InfixExpression) String() string {
+	var out bytes.Buffer
+	out.WriteString("(")
+	out.WriteString(ie.Left.String())
+	out.WriteString(" " + ie.Operator + " ")
+	out.WriteString(ie.Right.String())
+	out.WriteString(")")
+	return out.String()
+}
 
 // === Statement Node Types ===
 
-// ColumnDefinition defines a column in a CREATE TABLE statement.
 type ColumnDefinition struct {
-	Name     *Identifier // Column name
-	DataType *Identifier // Data type (e.g., "TEXT", "INTEGER") - represented as an Identifier for now
+	Name       *Identifier
+	DataType   *Identifier  // e.g., "VARCHAR", "BOOLEAN", "INTEGER"
+	TypeParams []Expression // For VARCHAR(n), NUMERIC(p,s). Can be *LiteralValue for n.
 }
 
 func (cd *ColumnDefinition) TokenLiteral() string { return cd.Name.TokenLiteral() }
 func (cd *ColumnDefinition) String() string {
-	return cd.Name.String() + " " + cd.DataType.String()
+	s := cd.Name.String() + " " + cd.DataType.String()
+	if len(cd.TypeParams) > 0 {
+		var paramsStr []string
+		for _, p := range cd.TypeParams {
+			paramsStr = append(paramsStr, p.String())
+		}
+		s += "(" + strings.Join(paramsStr, ", ") + ")"
+	}
+	return s
 }
 
-// CreateTableStatement represents a CREATE TABLE statement.
 type CreateTableStatement struct {
-	Token     token.Token // The 'CREATE' token
+	Token     token.Token
 	TableName *Identifier
 	Columns   []*ColumnDefinition
 }
@@ -75,15 +115,13 @@ func (cts *CreateTableStatement) String() string {
 	for _, c := range cts.Columns {
 		cols = append(cols, c.String())
 	}
-	return "CREATE TABLE " + cts.TableName.String() + " (" + strings.Join(cols, ", ") + ")"
+	return fmt.Sprintf("CREATE TABLE %s (%s)", cts.TableName.String(), strings.Join(cols, ", "))
 }
 
-// InsertStatement represents an INSERT INTO ... VALUES ... statement.
 type InsertStatement struct {
-	Token     token.Token // The 'INSERT' token
+	Token     token.Token
 	TableName *Identifier
-	// Columns   []*Identifier // Optional: list of columns to insert into, not handled in this MVP
-	Values    [][]Expression // A list of rows (tuples) to insert, each row is a list of expressions (literals for now)
+	Values    [][]Expression
 }
 
 func (is *InsertStatement) statementNode()       {}
@@ -97,29 +135,22 @@ func (is *InsertStatement) String() string {
 		}
 		rowsStr = append(rowsStr, "("+strings.Join(exprsStr, ", ")+")")
 	}
-	return "INSERT INTO " + is.TableName.String() + " VALUES " + strings.Join(rowsStr, ", ")
+	return fmt.Sprintf("INSERT INTO %s VALUES %s", is.TableName.String(), strings.Join(rowsStr, ", "))
 }
 
-
-// SelectColumn represents an item in a SELECT clause (e.g., a column name or '*').
-// For this MVP, we'll simplify. A more robust AST would have specific types.
-// We can use an Expression for named columns, and a special struct for '*'.
-
-// StarSelectColumn represents a '*' in a SELECT statement.
 type StarSelectColumn struct {
-	Token token.Token // The token.ASTERISK token
+	Token token.Token // token.ASTERISK
 }
-func (ssc *StarSelectColumn) expressionNode() {} // Can act as an expression in some contexts
+
+func (ssc *StarSelectColumn) expressionNode()      {}
 func (ssc *StarSelectColumn) TokenLiteral() string { return ssc.Token.Literal }
 func (ssc *StarSelectColumn) String() string       { return "*" }
 
-
-// SelectStatement represents a SELECT statement.
-// This is a very simplified version for "SELECT <columns> FROM <table>".
 type SelectStatement struct {
-	Token     token.Token // The 'SELECT' token
-	TableName *Identifier
-	Columns   []Expression // List of columns to select. Can be *Identifier or specific *StarSelectColumn.
+	Token       token.Token
+	TableName   *Identifier
+	Columns     []Expression
+	WhereClause Expression
 }
 
 func (ss *SelectStatement) statementNode()       {}
@@ -129,12 +160,32 @@ func (ss *SelectStatement) String() string {
 	for _, col := range ss.Columns {
 		colsStr = append(colsStr, col.String())
 	}
-	return "SELECT " + strings.Join(colsStr, ", ") + " FROM " + ss.TableName.String()
+	base := fmt.Sprintf("SELECT %s FROM %s", strings.Join(colsStr, ", "), ss.TableName.String())
+	if ss.WhereClause != nil {
+		base += " WHERE " + ss.WhereClause.String()
+	}
+	return base
 }
 
-// Helper function for string join, not part of AST but used in String() methods.
-// Placed here to avoid import cycle if ast.go itself needed it from another package.
-// Alternatively, make String() methods on structs more self-contained or use fmt.Sprintf.
-// For now, ensuring `strings` is imported in the context where these structs are used.
-// The String() methods in this file already use `strings.Join`.
+type SaveStatement struct {
+	Token    token.Token
+	FilePath *LiteralValue
+}
+
+func (ss *SaveStatement) statementNode()       {}
+func (ss *SaveStatement) TokenLiteral() string { return ss.Token.Literal }
+func (ss *SaveStatement) String() string {
+	return fmt.Sprintf("SAVE %s", ss.FilePath.String())
+}
+
+type LoadStatement struct {
+	Token    token.Token
+	FilePath *LiteralValue
+}
+
+func (ls *LoadStatement) statementNode()       {}
+func (ls *LoadStatement) TokenLiteral() string { return ls.Token.Literal }
+func (ls *LoadStatement) String() string {
+	return fmt.Sprintf("LOAD %s", ls.FilePath.String())
+}
 ```

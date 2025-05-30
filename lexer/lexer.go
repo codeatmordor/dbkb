@@ -56,29 +56,72 @@ func (l *Lexer) NextToken() token.Token {
 		tok = newToken(token.COMMA, l.ch)
 	case ';':
 		tok = newToken(token.SEMICOLON, l.ch)
+	case '+':
+		tok = newToken(token.PLUS, l.ch)
+	case '-':
+		tok = newToken(token.MINUS, l.ch)
+	case '/':
+		tok = newToken(token.SLASH, l.ch)
 	case '*':
 		tok = newToken(token.ASTERISK, l.ch)
-	case '\'': // Start of a string literal
+	case '=':
+		tok = newToken(token.EQ, l.ch)
+	case '!':
+		if l.peekChar() == '=' {
+			ch := l.ch
+			l.readChar() // consume the '='
+			literal := string(ch) + string(l.ch)
+			tok = token.Token{Type: token.NEQ, Literal: literal}
+		} else {
+			// '!' by itself is not a standard SQL operator we're supporting here.
+			tok = newToken(token.ILLEGAL, l.ch)
+		}
+	case '<':
+		if l.peekChar() == '=' {
+			ch := l.ch
+			l.readChar() // consume the '='
+			literal := string(ch) + string(l.ch)
+			tok = token.Token{Type: token.LTE, Literal: literal}
+		} else if l.peekChar() == '>' {
+			ch := l.ch
+			l.readChar() // consume the '>'
+			literal := string(ch) + string(l.ch)
+			tok = token.Token{Type: token.ALT_NEQ, Literal: literal}
+		} else {
+			tok = newToken(token.LT, l.ch)
+		}
+	case '>':
+		if l.peekChar() == '=' {
+			ch := l.ch
+			l.readChar() // consume the '='
+			literal := string(ch) + string(l.ch)
+			tok = token.Token{Type: token.GTE, Literal: literal}
+		} else {
+			tok = newToken(token.GT, l.ch)
+		}
+	case '\'':
 		tok.Type = token.STRING
 		tok.Literal = l.readString()
+		// after readString, l.ch is the closing quote.
+		// The l.readChar() at the end of NextToken will consume it.
 	case 0:
 		tok.Literal = ""
 		tok.Type = token.EOF
 	default:
-		if isLetter(l.ch) { // Identifiers or keywords
+		if isLetter(l.ch) {
 			tok.Literal = l.readIdentifier()
-			tok.Type = token.LookupIdent(tok.Literal) // Check if it's a keyword
-			return tok                               // Early return because readIdentifier advances pointers
-		} else if isDigit(l.ch) { // Numbers
+			tok.Type = token.LookupIdent(tok.Literal)
+			return tok // readIdentifier already called readChar, so we return early
+		} else if isDigit(l.ch) {
 			tok.Type = token.INT
 			tok.Literal = l.readNumber()
-			return tok // Early return because readNumber advances pointers
+			return tok // readNumber already called readChar, so we return early
 		} else {
 			tok = newToken(token.ILLEGAL, l.ch)
 		}
 	}
 
-	l.readChar() // Advance to the next character
+	l.readChar() // Move to the next character for the *next* call to NextToken
 	return tok
 }
 
@@ -90,15 +133,17 @@ func (l *Lexer) skipWhitespace() {
 }
 
 // readIdentifier reads a sequence of letters/digits/underscores as an identifier.
+// It advances the lexer's position to the character *after* the identifier.
 func (l *Lexer) readIdentifier() string {
 	position := l.position
-	for isLetter(l.ch) || isDigit(l.ch) || l.ch == '_' {
+	for isLetter(l.ch) || isDigit(l.ch) { // Subsequent characters can also be digits
 		l.readChar()
 	}
 	return l.input[position:l.position]
 }
 
 // readNumber reads a sequence of digits as a number.
+// It advances the lexer's position to the character *after* the number.
 func (l *Lexer) readNumber() string {
 	position := l.position
 	for isDigit(l.ch) {
@@ -109,44 +154,50 @@ func (l *Lexer) readNumber() string {
 
 // readString reads a string literal enclosed in single quotes.
 // It handles escaped single quotes ('') inside the string.
+// It returns the content *between* the quotes.
+// Assumes l.ch is the opening single quote when called.
+// Leaves l.ch as the closing single quote.
 func (l *Lexer) readString() string {
 	var sb strings.Builder
-	l.readChar() // Consume the opening quote
+	// l.ch is the opening quote. Consume it to start reading the content.
+	// No, NextToken's case already identified it. We need to read *past* it.
+	// The char read by the main loop *before* this switch was the opening quote.
+	// So, l.readChar() here will get the first char *of the content*.
 
 	for {
-		if l.ch == 0 { // EOF before closing quote
-			// Consider this an illegal/unterminated string
-			// For now, returning what we have, but error handling could be added
+		l.readChar() // Read next char for content or closing quote
+		if l.ch == 0 {
+			// Unterminated string, error. For now, return what we have.
+			// A more robust lexer might return an ILLEGAL token or store an error.
 			return sb.String()
 		}
 		if l.ch == '\'' {
 			if l.peekChar() == '\'' { // Escaped single quote ('')
-				l.readChar() // Consume the first quote of the pair
-				sb.WriteByte(l.ch) // Write the second quote
-				l.readChar() // Consume the second quote
-			} else { // End of string
-				l.readChar() // Consume the closing quote
+				l.readChar()       // Consume the first quote of the 'pair' (which is current l.ch)
+				sb.WriteByte(l.ch) // Write the actual single quote (which was peekChar(), now current l.ch)
+				// Loop will continue, and next readChar will move past the second quote.
+			} else {
+				// This is the closing quote. Break loop. l.ch is this closing quote.
 				break
 			}
 		} else {
 			sb.WriteByte(l.ch)
-			l.readChar()
 		}
 	}
 	return sb.String()
 }
 
-// isLetter checks if the character is a letter or underscore (common for identifiers).
+// isLetter checks if the character is a letter (a-z, A-Z) or underscore.
 func isLetter(ch byte) bool {
 	return ('a' <= ch && ch <= 'z') || ('A' <= ch && ch <= 'Z') || ch == '_'
 }
 
-// isDigit checks if the character is a digit.
+// isDigit checks if the character is a digit (0-9).
 func isDigit(ch byte) bool {
 	return '0' <= ch && ch <= '9'
 }
 
-// newToken is a helper function to create a new Token.
+// newToken is a helper function to create a new Token from a single byte.
 func newToken(tokenType token.TokenType, ch byte) token.Token {
 	return token.Token{Type: tokenType, Literal: string(ch)}
 }
