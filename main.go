@@ -2,35 +2,32 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 
-	"github.com/jeroenrinzema/psql-wire/pkg/codes"
-	"github.com/jeroenrinzema/psql-wire/pkg/messages"
-	"github.com/jeroenrinzema/psql-wire/pkg/oid"
-	_ "github.com/mattn/go-sqlite3"
+	"inmempg/ast"
+	"inmempg/database"
+	"inmempg/lexer"
+	"inmempg/parser"
+	"inmempg/token"
 
 	"github.com/jeroenrinzema/psql-wire"
-	"github.com/jeroenrinzema/psql-wire/pkg/buffer" // Required for sendErrorResponse if used
+	"github.com/jeroenrinzema/psql-wire/pkg/oid"
 )
 
-// Global variable for the SQLite database instance
-var sqliteDB *sql.DB
+var memDB *database.Database
 
 func main() {
-	var err error
-	sqliteDB, err = initSQLite()
-	if err != nil {
-		log.Fatalf("Failed to initialize SQLite database: %v", err)
-	}
+	memDB = database.NewDatabase()
+	log.Println("In-memory database initialized.")
 
-	authStrategy := psqlwire.ClearTextPassword(func(ctx context.Context, database, username, password string) (context.Context, bool, error) {
-		log.Printf("Login attempt: db=%s, user=%s, password=[REDACTED]", database, username)
-		ctx = context.WithValue(ctx, "database", database)
-		ctx = context.WithValue(ctx, "username", username)
+	authStrategy := psqlwire.ClearTextPassword(func(ctx context.Context, dbName, username, password string) (context.Context, bool, error) {
+		log.Printf("Login attempt: db=%s, user=%s, password=[REDACTED]", dbName, username)
+		ctx = context.WithValue(ctx, psqlwire.UsernameKey{}, username)
+		ctx = context.WithValue(ctx, psqlwire.DatabaseKey{}, dbName)
 		return ctx, true, nil
 	})
 
@@ -38,7 +35,43 @@ func main() {
 		psqlwire.SessionAuthStrategy(authStrategy),
 	}
 
-	server, err := psqlwire.NewServer(handleQueryParseFn, opts...)
+	parseFn := func(ctx context.Context, query string) (psqlwire.PreparedStatements, error) {
+		log.Printf("Received query from %s: %s", psqlwire.RemoteAddress(ctx), query)
+
+		if strings.TrimSpace(strings.ToLower(query)) == "select 1" {
+			cols := psqlwire.Columns{
+				psqlwire.Column{Name: "?column?", Oid: oid.Int4, Format: psqlwire.TextFormat},
+			}
+			stmtFn := func(execCtx context.Context, writer psqlwire.DataWriter, params []psqlwire.Parameter) error {
+				log.Printf("Executing hardcoded 'SELECT 1' for %s", psqlwire.RemoteAddress(execCtx))
+				if err := writer.Row([]any{int32(1)}); err != nil {
+					return fmt.Errorf("failed to write data row for SELECT 1: %w", err)
+				}
+				return writer.Complete("SELECT 1")
+			}
+			preparedStatement := psqlwire.NewStatement(stmtFn, psqlwire.WithColumns(cols))
+			return psqlwire.Prepared(preparedStatement), nil
+		}
+		
+		l := lexer.New(query)
+		p := parser.New(l)
+		astStatement := p.ParseStatement()
+
+		parserErrors := p.Errors()
+		if len(parserErrors) > 0 {
+			log.Printf("Parser errors for query '%s': %v", query, parserErrors)
+			return nil, fmt.Errorf("parser error: %s", strings.Join(parserErrors, "; "))
+		}
+
+		if astStatement == nil {
+			log.Printf("Parser returned nil statement for query: %s", query)
+			return nil, fmt.Errorf("failed to parse query into a valid statement")
+		}
+
+		return executeStatement(ctx, memDB, astStatement)
+	}
+
+	server, err := psqlwire.NewServer(parseFn, opts...)
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
@@ -57,221 +90,161 @@ func main() {
 	}
 }
 
-// mapSQLiteTypeToPgOid maps SQLite type names to PostgreSQL OIDs.
-func mapSQLiteTypeToPgOid(sqliteType string) oid.Oid {
-	// SQLite types are often dynamic. DatabaseTypeName() can return various things.
-	// Common ones: "TEXT", "INTEGER", "REAL", "BLOB", "NULL".
-	// Also, affinity based types like "NUMERIC", "DATETIME" might appear.
-	// This mapping is basic and might need refinement.
-	upperSqliteType := strings.ToUpper(sqliteType)
-	switch upperSqliteType {
-	case "TEXT", "VARCHAR", "CHAR", "CLOB":
-		return oid.Text
-	case "INTEGER", "INT", "BIGINT", "MEDIUMINT", "SMALLINT", "TINYINT":
-		return oid.Int8 // Using Int8 for safety as SQLite INTEGER can be 64-bit.
-	case "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL": // NUMERIC/DECIMAL might be better as oid.Numeric
-		return oid.Float8
-	case "BLOB":
-		return oid.Bytea
-	case "NULL": // A column might be typed as NULL if all values in a sample are NULL.
-		return oid.Text // Default to Text for NULL type columns
-	case "DATETIME", "TIMESTAMP", "DATE", "TIME":
-		return oid.Timestamp // Or oid.Date, oid.Time, oid.Timestamptz depending on specifics
-	default:
-		log.Printf("Unmapped SQLite type: %s, defaulting to oid.Text", sqliteType)
-		return oid.Text
-	}
-}
-
-func handleQueryParseFn(ctx context.Context, query string) (psqlwire.PreparedStatements, error) {
+func executeStatement(ctx context.Context, db *database.Database, stmt ast.Statement) (psqlwire.PreparedStatements, error) {
 	remoteAddr := psqlwire.RemoteAddress(ctx)
-	log.Printf("Received query from %s: %s", remoteAddr, query)
 
-	normalizedQuery := strings.TrimSpace(query)
-	lowerQuery := strings.ToLower(normalizedQuery)
-
-	if lowerQuery == "select 1" {
-		cols := psqlwire.Columns{
-			psqlwire.Column{Name: "?column?", Oid: oid.Int4, Format: psqlwire.TextFormat},
-		}
-		stmtFn := func(execCtx context.Context, writer psqlwire.DataWriter, params []psqlwire.Parameter) error {
-			log.Printf("Executing 'SELECT 1' for %s", psqlwire.RemoteAddress(execCtx))
-			if err := writer.Row([]any{int32(1)}); err != nil {
-				return fmt.Errorf("failed to write data row for SELECT 1: %w", err)
+	switch s := stmt.(type) {
+	case *ast.CreateTableStatement:
+		log.Printf("Executing CREATE TABLE statement for %s: %s", remoteAddr, s.TableName.Value)
+		var columnSchemas []database.ColumnSchema
+		for _, astColDef := range s.Columns {
+			colType, err := database.StringToBasicType(astColDef.DataType.Value)
+			if err != nil {
+				log.Printf("Error converting data type for column %s in table %s: %v", astColDef.Name.Value, s.TableName.Value, err)
+				return nil, fmt.Errorf("invalid data type for column %q: %w", astColDef.Name.Value, err)
 			}
-			return writer.Complete("SELECT 1")
+			columnSchemas = append(columnSchemas, database.ColumnSchema{
+				Name: astColDef.Name.Value,
+				Type: colType,
+			})
 		}
-		preparedStatement := psqlwire.NewStatement(stmtFn, psqlwire.WithColumns(cols))
-		return psqlwire.Prepared(preparedStatement), nil
-	}
-
-	if strings.HasPrefix(lowerQuery, "create table") {
-		// ... (CREATE TABLE handling as before) ...
-		log.Printf("Attempting to execute CREATE TABLE statement for %s: %s", remoteAddr, normalizedQuery)
-		_, err := sqliteDB.ExecContext(ctx, normalizedQuery)
+		err := db.CreateTable(s.TableName.Value, columnSchemas)
 		if err != nil {
-			log.Printf("Error executing CREATE TABLE for %s: %v. Query: %s", remoteAddr, err, normalizedQuery)
-			return nil, fmt.Errorf("failed to execute CREATE TABLE: %w", err)
+			log.Printf("Error creating table %s for %s: %v", s.TableName.Value, remoteAddr, err)
+			return nil, err
 		}
-		log.Printf("Successfully executed CREATE TABLE for %s: %s", remoteAddr, normalizedQuery)
+		log.Printf("Successfully created table %s for %s", s.TableName.Value, remoteAddr)
 		stmtFn := func(execCtx context.Context, writer psqlwire.DataWriter, params []psqlwire.Parameter) error {
 			return writer.Complete("CREATE TABLE")
 		}
 		preparedStatement := psqlwire.NewStatement(stmtFn)
 		return psqlwire.Prepared(preparedStatement), nil
-	}
 
-	if strings.HasPrefix(lowerQuery, "insert into") {
-		// ... (INSERT INTO handling as before) ...
-		log.Printf("Attempting to execute INSERT INTO statement for %s: %s", remoteAddr, normalizedQuery)
-		result, err := sqliteDB.ExecContext(ctx, normalizedQuery)
-		if err != nil {
-			log.Printf("Error executing INSERT INTO for %s: %v. Query: %s", remoteAddr, err, normalizedQuery)
-			return nil, fmt.Errorf("failed to execute INSERT INTO: %w", err)
+	case *ast.InsertStatement:
+		log.Printf("Executing INSERT INTO statement for %s: %s", remoteAddr, s.TableName.Value)
+		lowerTableName := strings.ToLower(s.TableName.Value)
+		table, exists := db.Tables[lowerTableName]
+		if !exists {
+			return nil, fmt.Errorf("table %q does not exist", s.TableName.Value)
 		}
-		rowsAffected, err := result.RowsAffected()
-		if err != nil {
-			log.Printf("Error getting rows affected for INSERT INTO for %s: %v. Query: %s", remoteAddr, err, normalizedQuery)
-			rowsAffected = 0
+		var rowsAffectedCount int64 = 0
+		for _, astRowValues := range s.Values {
+			if len(astRowValues) != len(table.Schema.Columns) {
+				return nil, fmt.Errorf("column count mismatch: table %q has %d columns, but %d values were supplied",
+					s.TableName.Value, len(table.Schema.Columns), len(astRowValues))
+			}
+			newGoRow := make(database.Row, len(astRowValues))
+			for i, astExpr := range astRowValues {
+				literal, ok := astExpr.(*ast.LiteralValue)
+				if !ok {
+					return nil, fmt.Errorf("INSERT values must be literals at this stage (got %T)", astExpr)
+				}
+				switch literal.Token.Type {
+				case token.INT:
+					val, err := strconv.ParseInt(literal.Value, 10, 64)
+					if err != nil {
+						return nil, fmt.Errorf("invalid integer literal %q: %w", literal.Value, err)
+					}
+					newGoRow[i] = val
+				case token.STRING:
+					newGoRow[i] = literal.Value
+				default:
+					return nil, fmt.Errorf("unsupported literal type %s in INSERT statement", literal.Token.Type)
+				}
+			}
+			err := db.InsertRow(s.TableName.Value, newGoRow)
+			if err != nil {
+				log.Printf("Error inserting row into table %s for %s: %v", s.TableName.Value, remoteAddr, err)
+				return nil, err
+			}
+			rowsAffectedCount++
 		}
-		log.Printf("Successfully executed INSERT INTO for %s: %s (%d rows affected)", remoteAddr, normalizedQuery, rowsAffected)
-		commandTag := fmt.Sprintf("INSERT 0 %d", rowsAffected)
+		log.Printf("Successfully inserted %d row(s) into table %s for %s", rowsAffectedCount, s.TableName.Value, remoteAddr)
+		commandTag := fmt.Sprintf("INSERT 0 %d", rowsAffectedCount)
 		stmtFn := func(execCtx context.Context, writer psqlwire.DataWriter, params []psqlwire.Parameter) error {
 			return writer.Complete(commandTag)
 		}
 		preparedStatement := psqlwire.NewStatement(stmtFn)
 		return psqlwire.Prepared(preparedStatement), nil
-	}
 
-	// Basic check for SELECT ... FROM ...
-	if strings.HasPrefix(lowerQuery, "select ") && strings.Contains(lowerQuery, " from ") {
-		log.Printf("Attempting to execute SELECT statement for %s: %s", remoteAddr, normalizedQuery)
+	case *ast.SelectStatement:
+		log.Printf("Executing SELECT statement for %s: %s", remoteAddr, s.TableName.Value)
 		
-		rows, err := sqliteDB.QueryContext(ctx, normalizedQuery)
-		if err != nil {
-			log.Printf("Error executing SELECT query for %s: %v. Query: %s", remoteAddr, err, normalizedQuery)
-			return nil, fmt.Errorf("failed to execute SELECT query: %w", err)
-		}
-		// Note: rows.Close() is called in the PreparedStatementFn
-
-		// Get column information for RowDescription
-		sqlColumnNames, err := rows.Columns()
-		if err != nil {
-			rows.Close()
-			log.Printf("Error getting column names for %s: %v", remoteAddr, err)
-			return nil, fmt.Errorf("failed to get column names: %w", err)
-		}
-
-		sqlColumnTypes, err := rows.ColumnTypes()
-		if err != nil {
-			rows.Close()
-			log.Printf("Error getting column types for %s: %v", remoteAddr, err)
-			return nil, fmt.Errorf("failed to get column types: %w", err)
-		}
-
-		psqlwireCols := make(psqlwire.Columns, len(sqlColumnNames))
-		for i, colName := range sqlColumnNames {
-			sqliteType := sqlColumnTypes[i].DatabaseTypeName()
-			pgOid := mapSQLiteTypeToPgOid(sqliteType)
-			psqlwireCols[i] = psqlwire.Column{
-				Name:   colName,
-				Oid:    pgOid,
-				Format: psqlwire.TextFormat, // Using text format for simplicity
+		var selectedColumnNames []string
+		if len(s.Columns) == 1 {
+			if _, ok := s.Columns[0].(*ast.StarSelectColumn); ok {
+				selectedColumnNames = []string{"*"}
 			}
-			log.Printf("Mapping column %s (SQLite type %s) to OID %d", colName, sqliteType, pgOid)
 		}
-
-		// PreparedStatementFn to send rows
-		stmtFn := func(execCtx context.Context, writer psqlwire.DataWriter, params []psqlwire.Parameter) error {
-			defer rows.Close() // Ensure rows is closed
-
-			var rowCount int64 = 0
-			scanArgs := make([]interface{}, len(psqlwireCols))
-			rawData := make([][]byte, len(psqlwireCols)) // For converting to []byte before string for text format
-			rowData := make([]interface{}, len(psqlwireCols))
-
-			for i := range scanArgs {
-				scanArgs[i] = &rawData[i]
-			}
-
-			for rows.Next() {
-				if err := rows.Scan(scanArgs...); err != nil {
-					log.Printf("Error scanning row for %s: %v", psqlwire.RemoteAddress(execCtx), err)
-					return fmt.Errorf("failed to scan row: %w", err)
+		if len(selectedColumnNames) == 0 { // Not a SELECT * or already processed as such
+			selectedColumnNames = make([]string, 0, len(s.Columns))
+			for _, colExpr := range s.Columns {
+				ident, ok := colExpr.(*ast.Identifier)
+				if !ok {
+					return nil, fmt.Errorf("unsupported select item: expected identifier or '*', got %T", colExpr)
 				}
+				selectedColumnNames = append(selectedColumnNames, ident.Value)
+			}
+		}
 
-				for i, raw := range rawData {
-					if raw == nil {
-						rowData[i] = nil // Keep nil as nil for NULL values
+		resultSchema, resultRows, err := db.SelectRows(s.TableName.Value, selectedColumnNames)
+		if err != nil {
+			log.Printf("Error selecting rows from table %s for %s: %v", s.TableName.Value, remoteAddr, err)
+			return nil, err
+		}
+
+		// Prepare RowDescription
+		psqlwireCols := make(psqlwire.Columns, len(resultSchema.Columns))
+		for i, colSchema := range resultSchema.Columns {
+			pgOid := database.BasicTypeToPgOid(colSchema.Type)
+			psqlwireCols[i] = psqlwire.Column{
+				Name:   colSchema.Name, // Use original casing from schema
+				Oid:    pgOid,
+				Format: psqlwire.TextFormat, // For simplicity, all columns as text
+			}
+		}
+
+		// Prepare PreparedStatementFn to send rows
+		stmtFn := func(execCtx context.Context, writer psqlwire.DataWriter, params []psqlwire.Parameter) error {
+			var rowCount int64 = 0
+			for _, dbRow := range resultRows {
+				rowDataForWire := make([]interface{}, len(dbRow))
+				for i, val := range dbRow {
+					if val == nil {
+						rowDataForWire[i] = nil // Pass nil directly
 					} else {
-						// For text format, convert all to string.
-						// This is a simplification. Binary format would require more careful type handling.
-						// Also, psql-wire might do some conversions based on OID for text, but string is safest.
-						valStr := string(raw)
-						
-						// Attempt to cast to appropriate type based on OID for more accurate representation if possible
-						// This is basic, more robust type handling would be needed for production
-														switch psqlwireCols[i].Oid {
-														case oid.Int2, oid.Int4, oid.Int8:
-																// Try to parse as int if possible, otherwise send as string
-																// For simplicity, keeping as string as TextFormat is used.
-																// If binary format were used, actual int types would be needed.
-																rowData[i] = valStr
-														case oid.Float4, oid.Float8:
-																rowData[i] = valStr
-														default:
-																rowData[i] = valStr
-														}
+						// Convert all values to string for TextFormat, as psql-wire expects string or []byte for text.
+						// More sophisticated type handling might be needed for binary format or specific client expectations.
+						switch v := val.(type) {
+						case int64:
+							rowDataForWire[i] = strconv.FormatInt(v, 10)
+						case float64:
+							rowDataForWire[i] = strconv.FormatFloat(v, 'f', -1, 64)
+						case string:
+							rowDataForWire[i] = v
+						case []byte:
+							rowDataForWire[i] = string(v) // Or handle as bytea appropriately if format was binary
+						default:
+							rowDataForWire[i] = fmt.Sprintf("%v", v)
+						}
 					}
 				}
-				
-				if err := writer.Row(rowData); err != nil {
-					log.Printf("Error writing data row for %s: %v", psqlwire.RemoteAddress(execCtx), err)
+				if err := writer.Row(rowDataForWire); err != nil {
+					log.Printf("Error writing data row for SELECT on %s for %s: %v", s.TableName.Value, remoteAddr, err)
 					return fmt.Errorf("failed to write data row: %w", err)
 				}
 				rowCount++
 			}
-
-			if err := rows.Err(); err != nil {
-				log.Printf("Error iterating rows for %s: %v", psqlwire.RemoteAddress(execCtx), err)
-				return fmt.Errorf("row iteration error: %w", err)
-			}
-			
-			log.Printf("Successfully sent %d rows for SELECT query from %s", rowCount, psqlwire.RemoteAddress(execCtx))
+			log.Printf("Successfully sent %d row(s) for SELECT on table %s for %s", rowCount, s.TableName.Value, remoteAddr)
 			return writer.Complete(fmt.Sprintf("SELECT %d", rowCount))
 		}
 
 		preparedStatement := psqlwire.NewStatement(stmtFn, psqlwire.WithColumns(psqlwireCols))
 		return psqlwire.Prepared(preparedStatement), nil
-	}
 
-	errMsg := fmt.Sprintf("Unsupported query: \"%s\". Only 'SELECT 1', 'CREATE TABLE ...', 'INSERT INTO ...', and 'SELECT * FROM ...' are supported.", query)
-	log.Printf("Unsupported query from %s: %s", remoteAddr, query)
-	return nil, fmt.Errorf(errMsg)
-}
-
-func initSQLite() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open SQLite database: %w", err)
-	}
-	log.Println("In-memory SQLite database initialized.")
-	return db, nil
-}
-
-func sendErrorResponse(ctx context.Context, conn net.Conn, code, errMsg string) {
-	writer := buffer.NewWriter(conn)
-	err := messages.Error{
-		Severity: messages.ErrorSeverityError,
-		Code:     codes.Code(code),
-		Message:  errMsg,
-	}.Encode(writer)
-	if err != nil {
-		log.Printf("Failed to encode error message: %v", err)
-		return
-	}
-	if err := writer.WriteTo(conn); err != nil {
-		log.Printf("Failed to send error response to %s: %v", conn.RemoteAddr(), err)
+	default:
+		log.Printf("Unsupported AST statement type for execution: %T for %s", s, remoteAddr)
+		return nil, fmt.Errorf("unsupported statement type for execution: %T", s)
 	}
 }
 ```
